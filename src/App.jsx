@@ -11,6 +11,199 @@ function clampInt(value, min = 0, max = 999999) {
 }
 
 function msFromHMS(h, m, s) {
+  return (h * 3600 + m * 60 + s) * 1000;
+}
+
+function hmsFromMs(ms) {
+  const totalSec = Math.max(0, Math.ceil(ms / 1000));
+  const h = Math.floor(totalSec / 3600);
+  const m = Math.floor((totalSec % 3600) / 60);
+  const s = totalSec % 60;
+  return { h, m, s };
+}
+
+function pad2(n) {
+  return String(n).padStart(2, "0");
+}
+
+export default function App() {
+  // Default = 15 minutes
+  const [hours, setHours] = useState("0");
+  const [minutes, setMinutes] = useState("15");
+  const [seconds, setSeconds] = useState("0");
+
+  const durationMs = useMemo(() => {
+    const h = clampInt(hours, 0);
+    const m = clampInt(minutes, 0, 59);
+    const s = clampInt(seconds, 0, 59);
+    return msFromHMS(h, m, s);
+  }, [hours, minutes, seconds]);
+
+  const [remainingMs, setRemainingMs] = useState(durationMs);
+  const [isRunning, setIsRunning] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+
+  // Keep remaining in sync with the inputs while stopped
+  useEffect(() => {
+    if (!isRunning) setRemainingMs(durationMs);
+  }, [durationMs, isRunning]);
+
+  const endTimeRef = useRef(null); // number | null
+  const rafRef = useRef(null);
+
+  // Audio setup (Web Audio API)
+  const audioCtxRef = useRef(null);
+  const thirtySecondAlertPlayedRef = useRef(false);
+  const zeroAlertPlayedRef = useRef(false);
+
+  // Soft glassy chime generator
+  const playDings = (count) => {
+    if (!audioCtxRef.current) {
+      audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    const ctx = audioCtxRef.current;
+    const now = ctx.currentTime;
+
+    for (let i = 0; i < count; i++) {
+      const t0 = now + i * 0.45;
+
+      const osc1 = ctx.createOscillator();
+      const osc2 = ctx.createOscillator();
+      const gain = ctx.createGain();
+
+      osc1.type = "sine";
+      osc2.type = "triangle";
+
+      // Glassy chime frequencies
+      osc1.frequency.value = 660;
+      osc2.frequency.value = 990;
+
+      // Gentle bell-like decay
+      gain.gain.setValueAtTime(0.0001, t0);
+      gain.gain.exponentialRampToValueAtTime(0.35, t0 + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.6);
+
+      // Slight pitch drop for realism
+      osc1.frequency.exponentialRampToValueAtTime(520, t0 + 0.6);
+      osc2.frequency.exponentialRampToValueAtTime(780, t0 + 0.6);
+
+      osc1.connect(gain);
+      osc2.connect(gain);
+      gain.connect(ctx.destination);
+
+      osc1.start(t0);
+      osc2.start(t0);
+      osc1.stop(t0 + 0.65);
+      osc2.stop(t0 + 0.65);
+    }
+  };
+
+  const tick = () => {
+    if (!endTimeRef.current) return;
+
+    const msLeft = Math.max(0, endTimeRef.current - Date.now());
+    setRemainingMs(msLeft);
+
+    const secondsLeft = Math.ceil(msLeft / 1000);
+
+    // 30-second alert (play once)
+    if (secondsLeft === 30 && !thirtySecondAlertPlayedRef.current) {
+      playDings(3);
+      thirtySecondAlertPlayedRef.current = true;
+    }
+
+    if (msLeft <= 0) {
+      if (!zeroAlertPlayedRef.current) {
+        playDings(5);
+        zeroAlertPlayedRef.current = true;
+      }
+      setIsRunning(false);
+      endTimeRef.current = null;
+      rafRef.current = null;
+      return;
+    }
+
+    rafRef.current = requestAnimationFrame(tick);
+  };
+
+  const start = () => {
+    const base = remainingMs > 0 ? remainingMs : durationMs;
+    if (base <= 0) return;
+
+    endTimeRef.current = Date.now() + base;
+    thirtySecondAlertPlayedRef.current = false;
+    zeroAlertPlayedRef.current = false;
+    setIsRunning(true);
+  };
+
+  const stop = () => {
+    if (!endTimeRef.current) {
+      setIsRunning(false);
+      return;
+    }
+    const msLeft = Math.max(0, endTimeRef.current - Date.now());
+    endTimeRef.current = null;
+    setIsRunning(false);
+    setRemainingMs(msLeft);
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    rafRef.current = null;
+  };
+
+  const restart = () => {
+    if (durationMs <= 0) return;
+    endTimeRef.current = Date.now() + durationMs;
+    setRemainingMs(durationMs);
+    thirtySecondAlertPlayedRef.current = false;
+    zeroAlertPlayedRef.current = false;
+    setIsRunning(true);
+  };
+
+  // Drive animation frame loop only while running
+  useEffect(() => {
+    if (isRunning) {
+      if (!endTimeRef.current) endTimeRef.current = Date.now() + remainingMs;
+      rafRef.current = requestAnimationFrame(tick);
+      return () => {
+        if (rafRef.current) cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      };
+    }
+  }, [isRunning]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Space / Enter toggles start/stop (ignore when typing OR settings modal open)
+  useEffect(() => {
+    const onKeyDown = (e) => {
+      const tag = document.activeElement?.tagName?.toLowerCase();
+      const isTyping =
+        tag === "input" ||
+        tag === "textarea" ||
+        document.activeElement?.isContentEditable ||
+        showSettings;
+
+      if (isTyping) return;
+
+      if (e.code === "Space" || e.code === "Enter") {
+        e.preventDefault();
+        if (isRunning) stop();
+        else start();
+      }
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [isRunning, showSettings, remainingMs, durationMs]);
+
+  // Update tab title
+  useEffect(() => {
+    const { h, m, s } = hmsFromMs(remainingMs);
+    document.title = `${pad2(h)}:${pad2(m)}:${pad2(s)} ${isRunning ? "▶" : "⏸"}`;
+  }, [remainingMs, isRunning]);
+
+  const display = useMemo(() => {
+    const { h, m, s } = hmsFromMs(remainingMs);
+    return `${pad2(h)}:${pad2(m)}:${pad2(s)}`;
+  }, [remainingMs]);
+
   return (
     <div
       className="min-h-screen w-full flex items-center justify-center p-6"
@@ -28,11 +221,14 @@ function msFromHMS(h, m, s) {
         <div className="rounded-[2.25rem] bg-black/35 backdrop-blur-md shadow-2xl border border-white/10 px-6 py-10 sm:px-10 sm:py-14">
           <div className="flex flex-col items-center text-center gap-6">
             <div className="text-white/80 tracking-wide text-sm">BREAK</div>
+
             <div className="font-mono text-white text-7xl sm:text-8xl md:text-9xl leading-none tracking-tight">
               {display}
             </div>
+
             <div className="text-white/65 text-sm">
-              Press <span className="text-white">Space</span> or <span className="text-white">Enter</span> to
+              Press <span className="text-white">Space</span> or{" "}
+              <span className="text-white">Enter</span> to
               {isRunning ? " pause" : " start"}.
             </div>
 
@@ -176,9 +372,7 @@ function SettingsModal({
           >
             Clear to set time
           </button>
-          <div className="sm:ml-auto text-white/45 text-xs self-center">
-            Press Esc to close
-          </div>
+          <div className="sm:ml-auto text-white/45 text-xs self-center">Press Esc to close</div>
         </div>
       </div>
     </div>
